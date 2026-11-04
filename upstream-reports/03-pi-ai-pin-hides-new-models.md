@@ -1,8 +1,8 @@
-# Local model catalog pinned to `@earendil-works/pi-ai@^0.99.1`: newer models (e.g. Claude Haiku 5.5) are missing or "Unknown model"
+# Local model catalog pinned to `@earendil-works/pi-ai@0.99.1`: newer models (e.g. Claude Haiku 5.5) are missing or "Unknown model"
 
 ## Environment
 
-- letta-code 0.34.39, built from `numtide/llm-agents.nix`, local backend
+- letta-code 0.34.39 (main `8762b9b`), local backend
 - Providers: Anthropic, `opencode`, `opencode-go`
 
 ## Steps to reproduce
@@ -10,70 +10,76 @@
 1. Start letta-code with the local backend and connect a provider that serves
    Claude Haiku 5.5.
 2. Open `/model`: Claude Haiku 5.5 isn't listed.
-3. Select `opencode/claude-haiku-5-5` or `opencode-go/claude-haiku-5-5`
-   explicitly.
+3. Select `opencode/claude-haiku-5-5` explicitly.
 
 ## Expected
 
-Models the connected provider serves show up in the picker and can be
-selected.
+Models the provider serves are listed and can be selected.
 
 ## Actual
-
-They're missing from the picker and catalog. Explicit selection fails:
 
 ```
 Unknown model "claude-haiku-5-5" for provider "opencode". Choose an available model with /model.
 ```
 
-(OpenCode does serve this model.)
+## Root cause
 
-## Root cause (origin/main `ebd590b11`)
+- `package.json:155` has `"@earendil-works/pi-ai": "^0.99.1"`. On a 0.x
+  version the caret only allows 0.99.x, and `bun.lock` resolves 0.99.1. The
+  local catalog is pi-ai's static provider data, which is inlined into the
+  bundle at build time.
+- The pi-ai tarballs give the following evidence (checked with `npm pack`
+  from the registry):
+  - npm `latest` is **1.5.0**.
+  - `claude-haiku-5-5` is absent from every 0.99.1 provider file.
+  - It is present in 1.4.0 and 1.5.0, in `dist/providers/data/`
+    `anthropic.json`, `opencode.json` and `opencode-go.json`, among others.
+- `src/backend/dev/pi-model-factory.ts:627-632` rejects any `modelId` that
+  pi-ai doesn't publish for the provider, so explicit selection fails even
+  though the endpoint serves the model.
+- `package.json:283` `patchedDependencies` keys
+  `patches/@earendil-works%2Fpi-ai@0.99.1.patch` (#5185) to the exact version.
 
-- `package.json:152` still pins `"@earendil-works/pi-ai": "^0.99.1"`, added
-  in 67bf68bf8 (#4861). The local catalog is pi-ai's static provider data,
-  which gets inlined into the bundle at build time. 0.99.1 predates Claude
-  Haiku 5.5 (pi-ai 1.4.0 has it).
-- `src/backend/dev/pi-model-factory.ts:627-632`: the local turn path rejects
-  any `modelId` that pi-ai doesn't publish for that provider. That produces
-  the "Unknown model" error for `opencode`/`opencode-go` even though the
-  endpoint serves the model.
-- The pin is sticky because `package.json:282` `patchedDependencies` applies
-  `patches/@earendil-works%2Fpi-ai@0.99.1.patch` (75d7921f1, #5185). The patch
-  is keyed to the exact version and edits
-  `dist/api/openai-completions.js` (`convertMessages`). It caps the replayed
-  `tool_call_id` at 40 characters only for real OpenAI/Azure hosts, so
-  OpenAI-compatible proxies (e.g. LiteLLM) keep long ids that carry Gemini
-  thought signatures. Any bump has to rebase or drop this patch.
-- Related: `src/agent/model-catalog.ts:43` hard-codes the `haiku` CLI alias to
-  `claude-haiku-4-5`. Once 5.5 is in the catalog, decide whether the alias
-  should point to it.
+## Is the local patch still needed? Yes
+
+The patch limits the 40-character `tool_call_id` cap in
+`dist/api/openai-completions.js` `convertMessages` to real OpenAI/Azure
+hosts, so OpenAI-compatible proxies keep long ids. In 1.5.0 the cap is still
+unconditional (`if (model.provider === "openai") return id.length > 40 ? ...`,
+line 879). The existing patch applies to 1.5.0 unchanged, apart from the
+version in its filename and key.
+
+## Trial bump to 1.5.0 (not committed)
+
+Steps: set the version to `1.5.0`, rename the patch, run `bun install`. The
+patch applied, and `tsc --noEmit` then failed with 3 errors:
+
+1. The provider `azure-openai-responses` was renamed to `azure`
+   (`KnownProvider`). That breaks `src/backend/dev/pi-provider-registry.ts:119`,
+   and the old id is also used in `src/backend/dev/pi-api-streams.ts` and
+   `src/providers/byok-providers.ts`. Stored connections that use the old id
+   need a migration.
+2. pi-ai no longer re-exports TypeBox (`Type`, `TSchema`), which breaks
+   `src/backend/dev/pi-stream-adapter.ts:9-11`. Fix: add a direct `typebox`
+   dependency (pi-ai 1.5.0 uses `typebox@1.3.27`) and import from it.
+
+These are mechanical, but the move is 0.x to 1.x: the provider data was
+restructured and the provider was renamed. Doing it properly needs the
+provider migration plus the local catalog / pi tests under Bun and the built
+Node bundle. That's more than a drive-by.
 
 ## Proposed fix
 
-1. Bump `@earendil-works/pi-ai` to the current release that includes Claude
-   Haiku 5.5 (>= 1.4.0).
-2. Patch:
-   - If newer pi-ai already limits the 40-char cap to OpenAI hosts (look in
-     `dist/api/openai-completions.js` for the `model.provider === "openai"`
-     id-normalization branch), drop the patch and its `patchedDependencies`
-     entry.
-   - Otherwise rebase the patch onto the new `dist` layout, rename it to the
-     new version, and upstream the fix to pi-ai so the pin stops being
-     sticky.
-3. Keep the existing regression test from #5185 green, and run the local
-   catalog tests (`setupRuntimeModelCatalogFixture` users) under both Bun
-   and the built Node bundle.
+1. Bump to `@earendil-works/pi-ai@1.5.0` (>= 1.4.0 for Haiku 5.5), and rename
+   the patch file and its `patchedDependencies` key.
+2. Map `azure-openai-responses` to `azure` everywhere LC names providers, and
+   migrate stored connections. Add a direct `typebox` import for `Type` and
+   `TSchema`.
+3. Run `src/backend/dev/pi-openai-tool-call-id.test.ts` (the #5185
+   regression), `src/providers/local-pi-provider-catalog.test.ts`, and the
+   other `pi-*` and local catalog tests, under Bun and the Node bundle.
+4. Upstream the host check to pi-ai so the pin stops being sticky.
+5. Decide whether the `haiku` alias (`src/agent/model-catalog.ts:41`, now
+   `claude-haiku-4-5`) should move to 5.5.
 
-## Not verified while drafting
-
-npm registry access wasn't available, so these are still open:
-
-- the exact latest pi-ai version, and whether 1.x contains the #5185 fix;
-- whether 1.x's `opencode` / `opencode-go` provider data lists
-  `claude-haiku-5-5`.
-
-To check:
-`npm view @earendil-works/pi-ai versions` and
-`npm pack @earendil-works/pi-ai@latest`, then grep the tarball's
-`dist/api/openai-completions.js` and its models data.
+Patch: none.
