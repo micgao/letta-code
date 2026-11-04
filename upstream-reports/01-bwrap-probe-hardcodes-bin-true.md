@@ -79,5 +79,6 @@ test container).
 Not affected: Seatbelt on macOS checks `/usr/bin/sandbox-exec`, which exists
 there.
 
-Patch: commit `fix(sandbox): resolve true from PATH in bwrap userns probe` on
-`puck/upstream-reports` (also contains the code from WIP commit `b8d2819`).
+Patch: `6d86d62` (`fix(sandbox): resolve true from PATH in bwrap userns probe`)
+on `puck/upstream-reports`, on top of WIP commit `b8d2819`, which holds most of
+the code change. Squash both when filing.
