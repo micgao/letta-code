@@ -82,3 +82,10 @@ there.
 Patch: `6d86d62` (`fix(sandbox): resolve true from PATH in bwrap userns probe`)
 on `puck/upstream-reports`, on top of WIP commit `b8d2819`, which holds most of
 the code change. Squash both when filing.
+
+## Workaround on NixOS
+
+Until the fix lands, NixOS users can enable `services.envfs.enable = true;`, which mounts
+an `/bin` (and `/usr/bin`) that resolves any program through the caller's `PATH`, so
+`/bin/true` exists and the probe succeeds. It is opt-in and most NixOS systems don't
+have it, so the probe should still resolve `true` from `PATH` itself.
