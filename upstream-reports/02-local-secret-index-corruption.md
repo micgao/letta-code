@@ -1,10 +1,12 @@
 # Local agent secret index becomes unparseable (`Unexpected non-whitespace character after JSON at position 52`)
 
-> **Status: producer not identified.** In main at `8762b9b` (v0.34.39, the
+> **Status: no producer in letta-code.** In main at `8762b9b` (v0.34.39, the
 > version where this was seen), letta-code has exactly one writer for the
-> index, and it can't produce the corrupted forms below. This report gives the
-> evidence and three confirmed defects nearby. It does not include a fix for
-> the corruption itself.
+> index, and it can't produce the corrupted forms below. A second pass checked
+> every other write path, and a concurrent-writer stress run reproduced the
+> nearby defects but never these forms. The writer is most likely outside
+> letta-code. This report gives the evidence and the confirmed defects
+> nearby. It does not include a fix for the corruption itself.
 
 ## Environment
 
@@ -58,6 +60,40 @@ new conversations can start with no secrets injected.
   `... at position 52 (line 1 column 53)`. The reported text has no
   line/column suffix, so check which `node` actually ran the reader.
 
+## Every write path ruled out (second pass)
+
+- **No newer writer.** `secrets-store.ts` and `secrets.ts` are unchanged from
+  0.34.36 to 0.34.39 (last change #5303).
+- **All entry points go through the three callers above:** `/secret` (TUI),
+  `letta secret` (CLI), and listener `secret_apply`. Every other importer only
+  reads: `index.ts`, `headless.ts`, `memory-filesystem.ts`,
+  `reminders/engine.ts`, `tools/script-tool-scope.ts`,
+  `tools/secret-substitution.ts`, `tools/impl/external-coding-agent.ts`,
+  `listener/secrets-sync.ts`, and listener `secret_list`. Subagent secret
+  inheritance (#4933) reads the in-memory cache only. There is no
+  migration or index-repair path.
+- **No append writer.** No `appendFile`, `"a"`-flag open, or append stream
+  touches the secrets file. The only generic append writer, the listener
+  `write_file` command (`websocket/listener/write-file-command.ts`), writes a
+  path the client names and never refers to secrets.
+- **No `join`/`String()` on the names** anywhere in the store, so form 3
+  can't come from letta-code.
+- **Racing writers don't produce it, checked by running them.** 6 concurrent
+  processes ran 40 `setSecretOnServer` calls each against the file store
+  (Node path, `LETTA_SKIP_KEYCHAIN_CHECK=1`), repeated over 5 rounds. Only
+  0-51 of 240 values survived. The index kept 1-24 names, and two rounds
+  ended with the store wiped (defects 1-3 below). The index was never
+  malformed and never in form 2 or 3.
+
+That leaves a text-level edit from outside letta-code. The shapes look like
+hand edits of the escaped string: `,"NAME"]` added after the closing `]`, and
+`names.join(",")`. One plausible editor is an agent's own shell or file tools.
+The filesystem sandbox masks only the memfs tree, so
+`<local-backend>/secrets/` is writable from agent shell commands. To catch the
+writer, run `inotifywait -m <local-backend>/secrets/` on the affected machine
+and match event times to processes. Also grep agent memory and skills for
+instructions that edit `local-agent-secrets.json`.
+
 ## Confirmed defects (present at `8762b9b`)
 
 1. **A failed parse wipes the store.** `readFileBackedLocalSecrets` (82-100)
@@ -95,6 +131,7 @@ new conversations can start with no secrets injected.
     the file fallback (`LETTA_SKIP_KEYCHAIN_CHECK=1`,
     `LETTA_LOCAL_BACKEND_DIR`).
 
-Patch: none. The producer isn't confirmed, and per the repo's
-"Impossible-State PRs" rule, hardening the reader alone would hide the
-symptom without fixing it.
+Patch: none. No letta-code producer exists (second pass above), and per the
+repo's "Impossible-State PRs" rule, hardening the reader alone would hide the
+symptom without fixing it. The hardening is still worth doing for defects
+1-3, which the stress run reproduces, but it belongs in its own change.
