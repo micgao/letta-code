@@ -60,10 +60,7 @@ test("probe falls back to bwrap itself when `true` is not on PATH", () => {
 
   expect(result.backend).toBe("bwrap");
   const usernsCall = calls.find((call) => call.args.includes("--unshare-user"));
-  expect(usernsCall?.args.slice(-2)).toEqual([
-    join(dir, "bwrap"),
-    "--version",
-  ]);
+  expect(usernsCall?.args.slice(-2)).toEqual([join(dir, "bwrap"), "--version"]);
 });
 
 test("probe failure reason includes bwrap's stderr", () => {
