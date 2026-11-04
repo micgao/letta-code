@@ -1,28 +1,21 @@
 # Local agent secret index becomes unparseable (`Unexpected non-whitespace character after JSON at position 52`)
 
-> **Status: producer not yet identified.** The newest source available when
-> this was drafted (origin/main `ebd590b11`, package version 0.34.36) has no
-> code path that appends to the index. The bug was seen on 0.34.39. See
-> "Open questions" before filing.
+> **Status: producer not identified.** In main at `8762b9b` (v0.34.39, the
+> version where this was seen), letta-code has exactly one writer for the
+> index, and it can't produce the corrupted forms below. This report gives the
+> evidence and three confirmed defects nearby. It does not include a fix for
+> the corruption itself.
 
 ## Environment
 
-- OS: NixOS, Linux; Node runtime (no `Bun.secrets`)
-- letta-code 0.34.39, built from `numtide/llm-agents.nix`
-- Backend: local, with a local agent that has stored secrets
+- NixOS, Linux; Node runtime (no `Bun.secrets`); letta-code 0.34.39
+- Local backend, local agent with stored secrets
 - Several letta-code processes active at once (TUI plus listener/subagents)
 
 ## Steps to reproduce
 
-Not yet minimal. Observed sequence:
-
-1. Store secrets on a local agent (`/secret set ...` or `letta secret set ...`).
-2. Keep the normal stack running and use it for a while.
-3. Run `/secret list` or `letta secret list`.
-
-## Expected
-
-The secret names are listed. New conversations hydrate every secret.
+Not minimal yet: store secrets on a local agent (`letta secret set ...`), keep
+the stack running for a while, then run `letta secret list`.
 
 ## Actual
 
@@ -30,84 +23,78 @@ The secret names are listed. New conversations hydrate every secret.
 Unexpected non-whitespace character after JSON at position 52
 ```
 
-The stored index value went through three forms over time:
+Over time the stored index went through three forms:
 
-1. A clean JSON array: `["A","B",...]` (exactly 52 characters).
-2. Two arrays run together: `["..."],"NAME"]`. Parsing stops at character
-   52, which is the error position.
-3. A bare comma-joined string (`A,B,NAME`). This is what `String(array)` or
-   `array.join(",")` produces, not `JSON.stringify`.
+1. A valid array `["A","B",...]` (52 characters).
+2. `["..."],"NAME"]`: a 52-character array followed by the tail of a longer
+   array. That's what you get when a shorter value overwrites a longer one in
+   place without truncating it.
+3. A bare `A,B,NAME`, which is what `String(array)` produces, not
+   `JSON.stringify`.
 
-Fixing the file by hand didn't last: the running stack corrupted it again.
+Hand-repairs didn't hold: the running stack corrupted the index again.
+Impact: `loadLocalAgentSecrets` reads the index first, so hydration throws and
+new conversations can start with no secrets injected.
 
-**Impact:** `loadLocalAgentSecrets` reads the index first. If the index can't
-be parsed, fresh secret hydration fails, and a new conversation can start
-with no secrets (API keys) injected.
+## What the code does (`src/utils/secrets-store.ts`, `8762b9b`)
 
-## Where the index is written (origin/main `ebd590b11`)
+- **Only writer:** `storeLocalSecretNames` (255-263) writes
+  `JSON.stringify(normalizeSecretNames(names))`, a full rewrite. Its callers
+  are `setLocalAgentSecret` (284), `deleteLocalAgentSecret` (296) and
+  `applyLocalSecretBatch` (314). No other code in `src/` names
+  `secrets:index` or `local-agent-secrets.json`.
+- **Under Node** `globalThis.Bun?.secrets` is `undefined`
+  (`src/utils/secrets.ts:9`), so every value, the index included, is stored
+  as a JSON string inside `<local-backend>/secrets/local-agent-secrets.json`
+  (`writeFileBackedLocalSecrets`, 102-110).
+- **A torn file can't explain this.** The index is an escaped string inside
+  that outer JSON document. If a write tears the file, the *outer* parse
+  fails, and `readFileBackedLocalSecrets` returns `{}`, which shows as "no
+  secrets", not as this error. The error means the outer file parsed and the
+  index *string* already held forms 2 or 3. So something other than
+  `storeLocalSecretNames` wrote that string: another tool, or another build
+  that shares the same local-backend dir.
+- **Runtime hint:** Node 22 (the supported floor) words this error as
+  `... at position 52 (line 1 column 53)`. The reported text has no
+  line/column suffix, so check which `node` actually ran the reader.
 
-All references are to `src/utils/secrets-store.ts` unless noted.
+## Confirmed defects (present at `8762b9b`)
 
-- **Index read**, `loadLocalSecretNames`, lines 240-253:
-  `JSON.parse(raw)`. The `SyntaxError` is rethrown as-is, which is the text
-  users see.
-- **Index write**, `storeLocalSecretNames`, lines 255-263:
-  `JSON.stringify(normalizeSecretNames(names))`. This is a **full rewrite**,
-  and it's the only writer of `agent:<id>:secrets:index` in the tree.
-  Callers: `setLocalAgentSecret` (284-294), `deleteLocalAgentSecret`
-  (296-312), `applyLocalSecretBatch` (314-339).
-- **Storage under Node:** `src/utils/secrets.ts:9` reads
-  `globalThis.Bun?.secrets`, which is `undefined` in the Node-targeted
-  bundle. `setAutoLocalSecretValue` (141-155) therefore always falls back to
-  the file store `<local-backend>/secrets/local-agent-secrets.json`. That
-  store keeps every value, the index included, as a string inside
-  `{ "secrets": { ... } }`.
-
-None of these paths can produce forms 2 or 3. The writer that appends is in
-code newer than 0.34.36, or outside letta-code.
-
-## Related defects found while tracing (present on origin/main)
-
-These don't produce the concatenated index on their own, but they make the
-store fragile under the multi-process setup where the bug appeared:
-
-1. **Parse failure is treated as "empty", which wipes the store.**
-   `readFileBackedLocalSecrets` (lines 82-100) returns `{}` from its `catch`.
-   The next `setFileBackedLocalSecret` (116-120) then writes a file holding
-   only the new key, silently deleting every other secret and the index.
-2. **Unlocked, non-atomic, cross-process read-modify-write.**
-   `writeFileBackedLocalSecrets` (102-110) calls `writeFileSync` on the live
-   path (truncate, then write) with no lock and no temp-file rename. Two
-   processes that interleave can leave a torn file. That triggers defect 1,
-   or one process's update gets lost.
-3. **Index lost update.** `setLocalAgentSecret` loads the names, writes the
-   value, and then rewrites the index from its own snapshot (284-294). A
-   concurrent writer's new name gets dropped, so the secret is stored but
-   never listed or hydrated.
+1. **A failed parse wipes the store.** `readFileBackedLocalSecrets` (82-100)
+   returns `{}` on any parse error. The next `setFileBackedLocalSecret`
+   (116-120) then writes a file holding only the new key, so every other
+   secret and the index are deleted.
+2. **Non-atomic, unlocked cross-process writes.** `writeFileSync` truncates
+   the live file and rewrites it. Nothing locks the file and nothing writes
+   to a temp file and renames it. Concurrent processes can tear the file
+   (which triggers defect 1) or lose each other's updates.
+3. **Lost index update.** `setLocalAgentSecret` snapshots the names, writes
+   the value, and then rewrites the index from that snapshot. If another
+   process adds a name in between, that name is dropped: the secret is
+   stored, but never listed or hydrated.
+4. **Split brain across runtimes.** Under Bun, `getAutoLocalSecretValue`
+   reads the keychain first, and `setAutoLocalSecretValue` writes there.
+   Under Node, both use the file. A Bun dev process and a Node build that
+   share one agent therefore keep two different indexes.
 
 ## Proposed fix
 
-- **Root cause (pending):** find the 0.34.39 writer that appends to or joins
-  the index (see below) and make it go through `storeLocalSecretNames`.
-- **Hardening (small, independent):**
-  - Write `local-agent-secrets.json` atomically: write
-    `local-agent-secrets.json.<pid>.tmp` with `flush: true`, then `renameSync`
-    it over the target.
-  - Don't turn a parse failure into `{}` on the write path. Throw (or move the
-    bad file to `*.corrupt-<ts>`) so one bad read can't erase the store.
-  - Serialize read-modify-write with a lockfile (e.g. an `O_EXCL` lock next to
-    the store) so the TUI, listener, and subagents don't lose each other's
-    updates.
+- **Corruption (pending the producer):** on the affected machine, list every
+  process and tool that writes `local-agent-secrets.json`, and check whether
+  any build or tool other than letta-code 0.34.39 shares the local-backend
+  dir. Inspect key names only, never values.
+- **Hardening, each small and independent:**
+  - Atomic write in `writeFileBackedLocalSecrets`: write
+    `local-agent-secrets.json.<pid>.tmp` with `flush: true`, then
+    `renameSync` it over the target.
+  - On the write path, throw on a parse failure instead of using `{}`, or
+    move the bad file to `*.corrupt-<ts>` first.
+  - Serialize the read-modify-write under an `O_EXCL` lockfile next to the
+    store, and re-read the index inside the lock (fixes defect 3).
+  - Tests belong in `src/cli/commands/secret.test.ts`, which already covers
+    the file fallback (`LETTA_SKIP_KEYCHAIN_CHECK=1`,
+    `LETTA_LOCAL_BACKEND_DIR`).
 
-No code change is included for this bug. Hardening the consumer without
-finding the producer would hide the symptom rather than fix it.
-
-## Open questions (to settle before filing)
-
-1. Get the 0.34.39 source and look for other writers:
-   `git fetch origin && git log --oneline v0.34.36..v0.34.39 -- src/utils/secrets-store.ts src/utils/secrets.ts`,
-   and `grep -n 'secrets:index' <letta.js bundle>`.
-2. Check which store holds the index on the affected machine (keychain vs
-   `local-agent-secrets.json`), using **key names only**.
-3. List every process that was running when it re-corrupted (TUI, listener,
-   reflection subagent, any external tool that writes the same file).
+Patch: none. The producer isn't confirmed, and per the repo's
+"Impossible-State PRs" rule, hardening the reader alone would hide the
+symptom without fixing it.
