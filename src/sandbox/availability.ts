@@ -135,34 +135,75 @@ function probe(platform: NodeJS.Platform): SandboxAvailability {
   };
 }
 
-function probeBwrap(): SandboxAvailability {
+export interface BwrapProbeDeps {
+  /** Spawn implementation (tests inject a fake). Defaults to `spawnSync`. */
+  spawn?: (
+    command: string,
+    args: string[],
+    options: { timeout: number },
+  ) => {
+    error?: Error;
+    status: number | null;
+    stderr?: Buffer | string | null;
+  };
+  /** PATH used to resolve `bwrap` and `true`. Defaults to `process.env.PATH`. */
+  envPath?: string;
+}
+
+/** Probe bwrap and unprivileged user namespaces. Exported for tests. */
+export function probeBwrap(deps: BwrapProbeDeps = {}): SandboxAvailability {
+  const spawn = deps.spawn ?? spawnSync;
+  const envPath = deps.envPath ?? process.env.PATH;
+
   // `bwrap` must exist on PATH (a bundled fallback can be wired in later).
-  const bwrapPath = resolveExecutableOnPath("bwrap");
+  const bwrapPath = resolveExecutableOnPath("bwrap", envPath);
   if (!bwrapPath) {
     return { backend: null, reason: "bwrap not found on PATH" };
   }
 
-  const version = spawnSync(bwrapPath, ["--version"], { timeout: 5000 });
+  const version = spawn(bwrapPath, ["--version"], { timeout: 5000 });
   if (version.error || version.status !== 0) {
     return { backend: null, reason: "bwrap not found on PATH" };
   }
 
   // Confirm unprivileged user namespaces actually work (they don't in WSL1 or
-  // some hardened/container hosts). A read-only root + /bin/true is the
-  // cheapest mount that exercises the namespace machinery.
-  const userns = spawnSync(
+  // some hardened/container hosts). A read-only root + a no-op command is the
+  // cheapest mount that exercises the namespace machinery. Resolve `true` from
+  // PATH rather than hard-coding /bin/true: non-FHS hosts (NixOS, Guix) have
+  // no /bin/true, and the root bind mount exposes the host path inside the
+  // sandbox. Fall back to bwrap itself, which we just proved exists.
+  const truePath = resolveExecutableOnPath("true", envPath);
+  const probeCommand = truePath ? [truePath] : [bwrapPath, "--version"];
+  const userns = spawn(
     bwrapPath,
-    ["--ro-bind", "/", "/", "--unshare-user", "/bin/true"],
+    ["--ro-bind", "/", "/", "--unshare-user", ...probeCommand],
     { timeout: 5000 },
   );
   if (userns.error || userns.status !== 0) {
+    const detail = describeProbeFailure(userns);
     return {
       backend: null,
-      reason: "bwrap present but user namespaces are unavailable",
+      reason:
+        "bwrap present but user namespaces are unavailable" +
+        (detail ? `: ${detail}` : ""),
     };
   }
 
   return { backend: "bwrap", bwrapPath, reason: "bwrap available" };
+}
+
+/**
+ * First line of bwrap's stderr (or the spawn error), so the warning shows the
+ * real cause, e.g. `execvp ...: No such file or directory` vs a uid-map
+ * permission failure, instead of always blaming user namespaces.
+ */
+function describeProbeFailure(result: {
+  error?: Error;
+  stderr?: Buffer | string | null;
+}): string {
+  if (result.error) return result.error.message;
+  const stderr = result.stderr?.toString().trim() ?? "";
+  return stderr.split("\n")[0]?.slice(0, 200) ?? "";
 }
 
 function resolveExecutableOnPath(
