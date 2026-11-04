@@ -46,40 +46,62 @@ The patch limits the 40-character `tool_call_id` cap in
 `dist/api/openai-completions.js` `convertMessages` to real OpenAI/Azure
 hosts, so OpenAI-compatible proxies keep long ids. In 1.5.0 the cap is still
 unconditional (`if (model.provider === "openai") return id.length > 40 ? ...`,
-line 879). The existing patch applies to 1.5.0 unchanged, apart from the
-version in its filename and key.
+line 879). 1.4.0 has the same unconditional cap. The existing patch applies to both
+1.4.0 and 1.5.0 unchanged, apart from the version in its filename and key.
 
-## Trial bump to 1.5.0 (not committed)
+## Trial bumps (not committed)
 
-Steps: set the version to `1.5.0`, rename the patch, run `bun install`. The
-patch applied, and `tsc --noEmit` then failed with 3 errors:
+For each version: set it in `package.json`, rename the patch and its
+`patchedDependencies` key, run `bun install`, regenerate
+`npm-shrinkwrap.json` (`bun run runtime-graph:generate`, which needs the
+pinned npm 12.2.0 and Bun 1.3.14), then run `bun run check`. The patch
+applied cleanly both times. Every check passed except `tsc`.
 
-1. The provider `azure-openai-responses` was renamed to `azure`
-   (`KnownProvider`). That breaks `src/backend/dev/pi-provider-registry.ts:119`,
-   and the old id is also used in `src/backend/dev/pi-api-streams.ts` and
-   `src/providers/byok-providers.ts`. Stored connections that use the old id
-   need a migration.
-2. pi-ai no longer re-exports TypeBox (`Type`, `TSchema`), which breaks
-   `src/backend/dev/pi-stream-adapter.ts:9-11`. Fix: add a direct `typebox`
-   dependency (pi-ai 1.5.0 uses `typebox@1.3.27`) and import from it.
+**1.5.0**, 3 errors:
 
-These are mechanical, but the move is 0.x to 1.x: the provider data was
-restructured and the provider was renamed. Doing it properly needs the
-provider migration plus the local catalog / pi tests under Bun and the built
-Node bundle. That's more than a drive-by.
+```
+src/backend/dev/pi-provider-registry.ts(119,5): error TS2353: Object literal may only specify known properties, and '"azure-openai-responses"' does not exist in type 'Partial<Record<KnownProvider, string>>'.
+src/backend/dev/pi-stream-adapter.ts(9,3): error TS2305: Module '"@earendil-works/pi-ai"' has no exported member 'TSchema'.
+src/backend/dev/pi-stream-adapter.ts(11,29): error TS2305: Module '"@earendil-works/pi-ai"' has no exported member 'Type'.
+```
+
+1.5.0 drops TypeBox entirely: its dependencies list
+`@earendil-works/pi-schema` and no `typebox`. Tool schemas would have to be
+ported to pi-schema's builders. Adding a direct `typebox` dependency would
+type-check, but pi-ai would no longer share that schema type.
+
+**1.4.0** (the first version with Haiku 5.5; still depends on
+`typebox@1.3.27` and re-exports `Type`/`TSchema`), 1 error:
+
+```
+src/backend/dev/pi-provider-registry.ts(119,5): error TS2353: Object literal may only specify known properties, and '"azure-openai-responses"' does not exist in type 'Partial<Record<KnownProvider, string>>'.
+```
+
+**First real blocker: the Azure provider id.** From 1.4.0 on, the provider
+`azure-openai-responses` is `azure`. The *API* name `azure-openai-responses`
+is unchanged, so `src/backend/dev/pi-api-streams.ts` is fine as written.
+pi-ai ships no alias for the old provider id. The compile fix is two keys:
+`PI_TUI_DEFAULT_MODEL_IDS` in `pi-provider-registry.ts` and
+`LOCAL_PROVIDER_DISPLAY_NAMES` in `src/providers/byok-providers.ts`. The
+open part is stored state. Existing `azure-openai-responses/<model>`
+handles and saved provider credentials would stop resolving unless LC maps
+the old id to `azure` when it loads them. That is a maintainer decision, so
+the bump stops here.
 
 ## Proposed fix
 
-1. Bump to `@earendil-works/pi-ai@1.5.0` (>= 1.4.0 for Haiku 5.5), and rename
-   the patch file and its `patchedDependencies` key.
-2. Map `azure-openai-responses` to `azure` everywhere LC names providers, and
-   migrate stored connections. Add a direct `typebox` import for `Type` and
-   `TSchema`.
+1. Bump to exactly `1.4.0`. It is the smallest jump that has Haiku 5.5 and
+   avoids the pi-schema port. Rename the patch to `@1.4.0` (content
+   unchanged) and regenerate `npm-shrinkwrap.json`.
+2. Rename the two `azure-openai-responses` provider keys to `azure`, and map
+   the old provider id to `azure` wherever stored handles and auth are
+   loaded.
 3. Run `src/backend/dev/pi-openai-tool-call-id.test.ts` (the #5185
    regression), `src/providers/local-pi-provider-catalog.test.ts`, and the
    other `pi-*` and local catalog tests, under Bun and the Node bundle.
 4. Upstream the host check to pi-ai so the pin stops being sticky.
-5. Decide whether the `haiku` alias (`src/agent/model-catalog.ts:41`, now
+5. Later, for 1.5.x: port `pi-stream-adapter.ts` from TypeBox to pi-schema.
+6. Decide whether the `haiku` alias (`src/agent/model-catalog.ts:41`, now
    `claude-haiku-4-5`) should move to 5.5.
 
-Patch: none.
+Patch: none (bump blocked by the Azure provider-id rename; see "Trial bumps").
